@@ -100,70 +100,42 @@ def get_drug_recommendations(condition_name, top_k=5, batch_size=50):
     
     cond_id = condition_ids[condition_name]
     all_drug_ids = list(range(len(drug_ids)))
-    total_drugs = len(all_drug_ids)
     
     all_predictions = []
     
-    # Check input shape requirements
-    input_shape = input_details[0]['shape']
-    input_dtype = input_details[0]['dtype']
+    # Model expects SINGLE numbers, not arrays
+    # Input shape [1, 1] means batch_size=1, value=1 for each call
     
-    logger.debug(f"Model expects input shape: {input_shape}, dtype: {input_dtype}")
-    
-    # Process in batches to save memory
-    for i in range(0, total_drugs, batch_size):
-        batch_drugs = all_drug_ids[i:i + batch_size]
-        batch_len = len(batch_drugs)
+    for drug_idx in all_drug_ids:
+        # Prepare inputs as SINGLE numbers in 2D shape [1, 1]
+        condition_input = np.array([[cond_id]], dtype=np.float32)  # Shape: [1, 1]
+        drug_input = np.array([[drug_idx]], dtype=np.float32)     # Shape: [1, 1]
         
-        # Prepare batch inputs based on model's expected shape
-        if len(input_shape) == 2:
-            # Model expects 2D input: [batch_size, 1] or [batch_size, features]
-            if input_shape[-1] == 1:
-                # Shape like [batch_size, 1]
-                cond_array = np.full((batch_len, 1), cond_id, dtype=input_dtype)
-                drug_array = np.array(batch_drugs, dtype=input_dtype).reshape(-1, 1)
-            else:
-                # General 2D case
-                cond_array = np.full((batch_len, input_shape[1]), cond_id, dtype=input_dtype)
-                drug_array = np.array(batch_drugs, dtype=input_dtype).reshape(-1, 1)
-        elif len(input_shape) == 1 and input_shape[0] == -1:
-            # Variable 1D input
-            cond_array = np.full(batch_len, cond_id, dtype=input_dtype)
-            drug_array = np.array(batch_drugs, dtype=input_dtype)
-        else:
-            # Default: assume 2D input
-            cond_array = np.full((batch_len, 1), cond_id, dtype=input_dtype)
-            drug_array = np.array(batch_drugs, dtype=input_dtype).reshape(-1, 1)
-        
-        # Debug logging
-        logger.debug(f"Batch {i//batch_size}: cond_array shape={cond_array.shape}, drug_array shape={drug_array.shape}")
-        
-        # Set inputs - verify which input is which
         try:
-            interpreter.set_tensor(input_details[0]['index'], cond_array)
-            interpreter.set_tensor(input_details[1]['index'], drug_array)
+            # Set inputs
+            interpreter.set_tensor(input_details[0]['index'], condition_input)
+            interpreter.set_tensor(input_details[1]['index'], drug_input)
             
             # Run inference
             interpreter.invoke()
             
-            # Get predictions
-            batch_predictions = interpreter.get_tensor(output_details[0]['index'])
-            all_predictions.extend(batch_predictions.flatten())
+            # Get prediction (single value)
+            prediction = interpreter.get_tensor(output_details[0]['index'])[0][0]
+            all_predictions.append(prediction)
             
         except ValueError as e:
-            # Try swapping inputs if the first attempt fails
-            logger.warning(f"First attempt failed: {e}. Trying swapped inputs...")
+            # Try swapping inputs
             try:
-                interpreter.set_tensor(input_details[0]['index'], drug_array)
-                interpreter.set_tensor(input_details[1]['index'], cond_array)
+                interpreter.set_tensor(input_details[0]['index'], drug_input)
+                interpreter.set_tensor(input_details[1]['index'], condition_input)
                 interpreter.invoke()
-                batch_predictions = interpreter.get_tensor(output_details[0]['index'])
-                all_predictions.extend(batch_predictions.flatten())
+                prediction = interpreter.get_tensor(output_details[0]['index'])[0][0]
+                all_predictions.append(prediction)
             except Exception as e2:
-                logger.error(f"Both input orders failed: {e2}")
-                raise RuntimeError(f"Model input error: {e2}")
+                logger.error(f"Failed for drug {drug_idx}: {e2}")
+                all_predictions.append(0.0)  # Default score
     
-    # Convert to numpy array
+    # Rest of your function remains the same...
     predictions = np.array(all_predictions)
     
     # Get top K recommendations
@@ -176,7 +148,7 @@ def get_drug_recommendations(condition_name, top_k=5, batch_size=50):
     for rank, idx in enumerate(top_indices, 1):
         raw_score = float(predictions[idx])
         
-        # Normalize score to 1-5 scale if we have multiple predictions
+        # Normalize score
         if len(predictions) > 1 and predictions.max() > predictions.min():
             normalized_score = 1 + 4 * ((raw_score - predictions.min()) / 
                                        (predictions.max() - predictions.min()))
@@ -194,6 +166,7 @@ def get_drug_recommendations(condition_name, top_k=5, batch_size=50):
     
     logger.info(f"Generated {len(recommendations)} recommendations for condition '{condition_name}'")
     return recommendations
+
 
 # --- API Routes ---
 @app.route('/health', methods=['GET'])

@@ -87,8 +87,8 @@ except Exception as e:
     interpreter = None
 
 # --- Helper Function with Batching ---
-def get_drug_recommendations(condition_name, top_k=5, batch_size=50):
-    """Get top K drug recommendations using quantized model with batching"""
+def get_drug_recommendations(condition_name, top_k=5):
+    """Get top K drug recommendations using quantized model"""
     global interpreter, condition_ids, drug_ids, id_to_drug, input_details
     
     if interpreter is None:
@@ -103,8 +103,7 @@ def get_drug_recommendations(condition_name, top_k=5, batch_size=50):
     
     all_predictions = []
     
-    # Model expects SINGLE numbers, not arrays
-    # Input shape [1, 1] means batch_size=1, value=1 for each call
+    logger.info(f"Scoring {len(all_drug_ids)} drugs for condition '{condition_name}' (ID: {cond_id})")
     
     for drug_idx in all_drug_ids:
         # Prepare inputs as SINGLE numbers in 2D shape [1, 1]
@@ -112,30 +111,27 @@ def get_drug_recommendations(condition_name, top_k=5, batch_size=50):
         drug_input = np.array([[drug_idx]], dtype=np.float32)     # Shape: [1, 1]
         
         try:
-            # Set inputs
+            # Try first input order
             interpreter.set_tensor(input_details[0]['index'], condition_input)
             interpreter.set_tensor(input_details[1]['index'], drug_input)
-            
-            # Run inference
             interpreter.invoke()
-            
-            # Get prediction (single value)
             prediction = interpreter.get_tensor(output_details[0]['index'])[0][0]
-            all_predictions.append(prediction)
             
-        except ValueError as e:
-            # Try swapping inputs
+        except ValueError:
+            # Try swapping inputs if first order fails
             try:
                 interpreter.set_tensor(input_details[0]['index'], drug_input)
                 interpreter.set_tensor(input_details[1]['index'], condition_input)
                 interpreter.invoke()
                 prediction = interpreter.get_tensor(output_details[0]['index'])[0][0]
-                all_predictions.append(prediction)
-            except Exception as e2:
-                logger.error(f"Failed for drug {drug_idx}: {e2}")
-                all_predictions.append(0.0)  # Default score
+            except Exception as e:
+                logger.warning(f"Failed for drug {drug_idx}: {e}")
+                prediction = 0.0
+        
+        # CONVERT numpy float32 to Python float
+        all_predictions.append(float(prediction))
     
-    # Rest of your function remains the same...
+    # Convert to numpy array
     predictions = np.array(all_predictions)
     
     # Get top K recommendations
@@ -146,9 +142,9 @@ def get_drug_recommendations(condition_name, top_k=5, batch_size=50):
     
     recommendations = []
     for rank, idx in enumerate(top_indices, 1):
-        raw_score = float(predictions[idx])
+        raw_score = float(predictions[idx])  # Already converted, but safe
         
-        # Normalize score
+        # Normalize score to 1-5 scale
         if len(predictions) > 1 and predictions.max() > predictions.min():
             normalized_score = 1 + 4 * ((raw_score - predictions.min()) / 
                                        (predictions.max() - predictions.min()))
@@ -159,14 +155,13 @@ def get_drug_recommendations(condition_name, top_k=5, batch_size=50):
             'drug': id_to_drug[idx],
             'drug_id': int(idx),
             'raw_score': round(raw_score, 4),
-            'effectiveness_score': round(normalized_score, 2),
+            'effectiveness_score': round(float(normalized_score), 2),  # CONVERT to float
             'effectiveness_display': f"{normalized_score:.2f}/5.00",
             'rank': rank
         })
     
     logger.info(f"Generated {len(recommendations)} recommendations for condition '{condition_name}'")
     return recommendations
-
 
 # --- API Routes ---
 @app.route('/health', methods=['GET'])

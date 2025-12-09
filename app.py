@@ -15,13 +15,13 @@ app = Flask(__name__)
 condition_ids = None
 drug_ids = None
 id_to_drug = None
-model = None
+interpreter = None
 input_details = None
 output_details = None
 
 def load_resources():
     """Load all required resources (mappings and model)"""
-    global condition_ids, drug_ids, id_to_drug, model, input_details, output_details
+    global condition_ids, drug_ids, id_to_drug, interpreter, input_details, output_details
     
     try:
         # Load mappings
@@ -64,11 +64,13 @@ def load_resources():
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
         
+        # Log detailed model info
         logger.info(f"✅ Model loaded successfully!")
-        logger.info(f"📊 Model info:")
-        logger.info(f"   - Input shape: {input_details[0]['shape']}")
-        logger.info(f"   - Input dtype: {input_details[0]['dtype']}")
-        logger.info(f"   - Output shape: {output_details[0]['shape']}")
+        logger.info("📊 Detailed model info:")
+        for i, inp in enumerate(input_details):
+            logger.info(f"   Input {i}: shape={inp['shape']}, dtype={inp['dtype']}, name={inp.get('name', 'N/A')}")
+        for i, out in enumerate(output_details):
+            logger.info(f"   Output {i}: shape={out['shape']}, dtype={out['dtype']}")
         
         return interpreter
         
@@ -82,13 +84,12 @@ try:
     logger.info("🚀 All resources loaded successfully!")
 except Exception as e:
     logger.error(f"💥 Failed to load resources: {e}")
-    # Don't exit - let the app start but it will fail on API calls
     interpreter = None
 
 # --- Helper Function with Batching ---
 def get_drug_recommendations(condition_name, top_k=5, batch_size=50):
     """Get top K drug recommendations using quantized model with batching"""
-    global interpreter, condition_ids, drug_ids, id_to_drug
+    global interpreter, condition_ids, drug_ids, id_to_drug, input_details
     
     if interpreter is None:
         raise RuntimeError("Model not loaded. Check server logs.")
@@ -103,62 +104,95 @@ def get_drug_recommendations(condition_name, top_k=5, batch_size=50):
     
     all_predictions = []
     
+    # Check input shape requirements
+    input_shape = input_details[0]['shape']
+    input_dtype = input_details[0]['dtype']
+    
+    logger.debug(f"Model expects input shape: {input_shape}, dtype: {input_dtype}")
+    
     # Process in batches to save memory
     for i in range(0, total_drugs, batch_size):
         batch_drugs = all_drug_ids[i:i + batch_size]
+        batch_len = len(batch_drugs)
         
-        # Prepare batch inputs - check model's expected dtype
-        input_dtype = input_details[0]['dtype']
-        
-        if input_dtype == np.float32:
-            cond_array = np.array([cond_id] * len(batch_drugs), dtype=np.float32)
-            drug_array = np.array(batch_drugs, dtype=np.float32)
-        elif input_dtype == np.int32:
-            cond_array = np.array([cond_id] * len(batch_drugs), dtype=np.int32)
-            drug_array = np.array(batch_drugs, dtype=np.int32)
+        # Prepare batch inputs based on model's expected shape
+        if len(input_shape) == 2:
+            # Model expects 2D input: [batch_size, 1] or [batch_size, features]
+            if input_shape[-1] == 1:
+                # Shape like [batch_size, 1]
+                cond_array = np.full((batch_len, 1), cond_id, dtype=input_dtype)
+                drug_array = np.array(batch_drugs, dtype=input_dtype).reshape(-1, 1)
+            else:
+                # General 2D case
+                cond_array = np.full((batch_len, input_shape[1]), cond_id, dtype=input_dtype)
+                drug_array = np.array(batch_drugs, dtype=input_dtype).reshape(-1, 1)
+        elif len(input_shape) == 1 and input_shape[0] == -1:
+            # Variable 1D input
+            cond_array = np.full(batch_len, cond_id, dtype=input_dtype)
+            drug_array = np.array(batch_drugs, dtype=input_dtype)
         else:
-            # Default to float32
-            cond_array = np.array([cond_id] * len(batch_drugs), dtype=np.float32)
-            drug_array = np.array(batch_drugs, dtype=np.float32)
+            # Default: assume 2D input
+            cond_array = np.full((batch_len, 1), cond_id, dtype=input_dtype)
+            drug_array = np.array(batch_drugs, dtype=input_dtype).reshape(-1, 1)
         
-        # Set inputs
-        interpreter.set_tensor(input_details[0]['index'], cond_array)
-        interpreter.set_tensor(input_details[1]['index'], drug_array)
+        # Debug logging
+        logger.debug(f"Batch {i//batch_size}: cond_array shape={cond_array.shape}, drug_array shape={drug_array.shape}")
         
-        # Run inference
-        interpreter.invoke()
-        
-        # Get predictions
-        batch_predictions = interpreter.get_tensor(output_details[0]['index'])
-        all_predictions.extend(batch_predictions.flatten())
+        # Set inputs - verify which input is which
+        try:
+            interpreter.set_tensor(input_details[0]['index'], cond_array)
+            interpreter.set_tensor(input_details[1]['index'], drug_array)
+            
+            # Run inference
+            interpreter.invoke()
+            
+            # Get predictions
+            batch_predictions = interpreter.get_tensor(output_details[0]['index'])
+            all_predictions.extend(batch_predictions.flatten())
+            
+        except ValueError as e:
+            # Try swapping inputs if the first attempt fails
+            logger.warning(f"First attempt failed: {e}. Trying swapped inputs...")
+            try:
+                interpreter.set_tensor(input_details[0]['index'], drug_array)
+                interpreter.set_tensor(input_details[1]['index'], cond_array)
+                interpreter.invoke()
+                batch_predictions = interpreter.get_tensor(output_details[0]['index'])
+                all_predictions.extend(batch_predictions.flatten())
+            except Exception as e2:
+                logger.error(f"Both input orders failed: {e2}")
+                raise RuntimeError(f"Model input error: {e2}")
     
     # Convert to numpy array
     predictions = np.array(all_predictions)
     
     # Get top K recommendations
+    if len(predictions) < top_k:
+        top_k = len(predictions)
+    
     top_indices = predictions.argsort()[-top_k:][::-1]
     
     recommendations = []
-    for idx in top_indices:
-        # Normalize score to 1-5 scale
+    for rank, idx in enumerate(top_indices, 1):
         raw_score = float(predictions[idx])
         
-        # Simple normalization (adjust based on your model's output range)
-        if predictions.max() > predictions.min():
+        # Normalize score to 1-5 scale if we have multiple predictions
+        if len(predictions) > 1 and predictions.max() > predictions.min():
             normalized_score = 1 + 4 * ((raw_score - predictions.min()) / 
                                        (predictions.max() - predictions.min()))
         else:
-            normalized_score = 3.0  # Default middle score
+            normalized_score = 3.0
         
         recommendations.append({
             'drug': id_to_drug[idx],
             'drug_id': int(idx),
-            'raw_score': float(raw_score),
+            'raw_score': round(raw_score, 4),
             'effectiveness_score': round(normalized_score, 2),
             'effectiveness_display': f"{normalized_score:.2f}/5.00",
-            'rank': len(recommendations) + 1
+            'rank': rank
         })
     
+    logger.info(f"Generated {len(recommendations)} recommendations for condition '{condition_name}'")
     return recommendations
 
 # --- API Routes ---
@@ -174,14 +208,15 @@ def health_check():
         "model_status": model_status,
         "available_conditions": len(condition_ids) if condition_ids else 0,
         "available_drugs": len(drug_ids) if drug_ids else 0,
-        "python_version": os.sys.version,
+        "python_version": os.sys.version.split()[0],
         "tensorflow_version": tf.__version__
     }
     
-    if interpreter is not None:
+    if interpreter is not None and input_details is not None:
         response.update({
-            "input_shape": str(input_details[0]['shape']),
-            "output_shape": str(output_details[0]['shape'])
+            "input_shapes": [str(inp['shape']) for inp in input_details],
+            "output_shape": str(output_details[0]['shape']),
+            "input_dtypes": [str(inp['dtype']) for inp in input_details]
         })
     
     return jsonify(response)
@@ -237,9 +272,9 @@ def list_conditions():
     
     conditions = list(condition_ids.keys())
     return jsonify({
-        "conditions": conditions,
+        "conditions": sorted(conditions),
         "count": len(conditions),
-        "first_10": conditions[:10]  # Preview
+        "first_10": sorted(conditions)[:10]
     })
 
 @app.route('/drugs', methods=['GET'])
@@ -250,9 +285,9 @@ def list_drugs():
     
     drugs = list(drug_ids.keys())
     return jsonify({
-        "drugs": drugs,
+        "drugs": sorted(drugs),
         "count": len(drugs),
-        "first_10": drugs[:10]  # Preview
+        "first_10": sorted(drugs)[:10]
     })
 
 @app.route('/condition/<name>', methods=['GET'])
@@ -262,13 +297,47 @@ def get_condition_info(name):
         return jsonify({"error": "Data not loaded"}), 503
     
     if name not in condition_ids:
-        return jsonify({"error": f"Condition '{name}' not found"}), 404
+        # Try case-insensitive search
+        name_lower = name.lower()
+        matches = [c for c in condition_ids.keys() if c.lower() == name_lower]
+        if matches:
+            name = matches[0]
+        else:
+            return jsonify({"error": f"Condition '{name}' not found"}), 404
     
     return jsonify({
         "condition": name,
         "condition_id": condition_ids[name],
         "exists": True
     })
+
+@app.route('/debug/model', methods=['GET'])
+def debug_model():
+    """Debug endpoint to see model details"""
+    if interpreter is None:
+        return jsonify({"error": "Model not loaded"}), 503
+    
+    info = {
+        "input_details": [],
+        "output_details": []
+    }
+    
+    for i, inp in enumerate(input_details):
+        info["input_details"].append({
+            "index": i,
+            "shape": inp['shape'].tolist() if hasattr(inp['shape'], 'tolist') else inp['shape'],
+            "dtype": str(inp['dtype']),
+            "name": inp.get('name', 'N/A')
+        })
+    
+    for i, out in enumerate(output_details):
+        info["output_details"].append({
+            "index": i,
+            "shape": out['shape'].tolist() if hasattr(out['shape'], 'tolist') else out['shape'],
+            "dtype": str(out['dtype'])
+        })
+    
+    return jsonify(info)
 
 @app.route('/', methods=['GET'])
 def index():
@@ -278,7 +347,8 @@ def index():
         "GET /conditions": "List all medical conditions",
         "GET /drugs": "List all drugs",
         "GET /condition/<name>": "Get info about specific condition",
-        "POST /recommend": "Get drug recommendations (requires JSON)"
+        "POST /recommend": "Get drug recommendations (requires JSON)",
+        "GET /debug/model": "Debug model info (development only)"
     }
     
     example_request = {
@@ -286,18 +356,14 @@ def index():
         "top_k": 3
     }
     
-    # Get the actual port being used
-    port = os.environ.get('PORT', '10000')
-    
     return jsonify({
         "message": "Drug Recommendation API",
-        "version": "2.0",
+        "version": "2.1",
         "description": "Machine learning API for drug recommendations based on medical conditions",
         "endpoints": endpoints,
         "example_request": example_request,
-        "curl_example": f"curl -X POST https://your-api.onrender.com/recommend -H 'Content-Type: application/json' -d '{{\"condition\": \"Pain\", \"top_k\": 3}}'",
-        "status": "running",
-        "port": port
+        "curl_example": "curl -X POST /recommend -H 'Content-Type: application/json' -d '{\"condition\": \"Pain\", \"top_k\": 3}'",
+        "status": "running" if interpreter is not None else "initializing"
     })
 
 # Error handlers
@@ -310,7 +376,6 @@ def method_not_allowed(error):
     return jsonify({"error": "Method not allowed"}), 405
 
 # --- App Startup Logic ---
-# This will run when the module is imported (always)
 def initialize_app():
     """Initialize the application"""
     logger.info(f"📦 TensorFlow version: {tf.__version__}")

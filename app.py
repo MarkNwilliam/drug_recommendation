@@ -1,7 +1,7 @@
 import numpy as np
 import pickle
 from flask import Flask, request, jsonify
-import tensorflow as tf  # Changed from tflite_runtime
+import tensorflow as tf
 import os
 import logging
 
@@ -286,13 +286,18 @@ def index():
         "top_k": 3
     }
     
+    # Get the actual port being used
+    port = os.environ.get('PORT', '10000')
+    
     return jsonify({
         "message": "Drug Recommendation API",
         "version": "2.0",
         "description": "Machine learning API for drug recommendations based on medical conditions",
         "endpoints": endpoints,
         "example_request": example_request,
-        "curl_example": "curl -X POST https://your-api.onrender.com/recommend -H 'Content-Type: application/json' -d '{\"condition\": \"Pain\", \"top_k\": 3}'"
+        "curl_example": f"curl -X POST https://your-api.onrender.com/recommend -H 'Content-Type: application/json' -d '{{\"condition\": \"Pain\", \"top_k\": 3}}'",
+        "status": "running",
+        "port": port
     })
 
 # Error handlers
@@ -304,17 +309,27 @@ def not_found(error):
 def method_not_allowed(error):
     return jsonify({"error": "Method not allowed"}), 405
 
-# --- Run the App ---
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    logger.info(f"🚀 Starting Drug Recommendation API on port {port}")
+# --- App Startup Logic ---
+# This will run when the module is imported (always)
+def initialize_app():
+    """Initialize the application"""
     logger.info(f"📦 TensorFlow version: {tf.__version__}")
     logger.info(f"🐍 Python version: {os.sys.version}")
     
     # Verify resources are loaded
     if interpreter is not None and condition_ids is not None:
         logger.info("✅ All systems ready!")
+        return True
     else:
         logger.warning("⚠️  Some resources failed to load. API may not function properly.")
-    
+        return False
+
+# Initialize when module loads
+app_ready = initialize_app()
+
+# This block only runs if you execute: python app.py
+# (Render uses gunicorn which imports the module, so this doesn't run in production)
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    logger.info(f"🚀 Starting Drug Recommendation API on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)

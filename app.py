@@ -4,12 +4,21 @@ from flask import Flask, request, jsonify
 import tensorflow as tf
 import os
 import logging
+from flask_cors import CORS
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+CORS(
+    app,
+    resources={r"/*": {"origins": "*"}},
+    supports_credentials=False
+)
+
 
 # --- Global Variables ---
 condition_ids = None
